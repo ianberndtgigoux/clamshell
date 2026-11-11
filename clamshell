@@ -1,0 +1,120 @@
+#!/bin/bash
+# clamshell — mantiene el Mac despierto con la tapa cerrada (pmset disablesleep),
+# con un watchdog que lo revierte solo. Nunca dejar disablesleep=1 sin plazo:
+# esa fue la falla de agosto 2026 (batería drenada, Mac sin dormir por días).
+#
+# Uso:
+#   sudo clamshell on [horas] [--while PID]   # default 4 horas
+#   sudo clamshell off
+#   clamshell status
+#
+# El watchdog (LaunchDaemon, cada 60s + al arrancar) apaga disablesleep si:
+#   - se venció el plazo
+#   - la batería bajó del umbral (default 20%) sin cargador
+#   - murió el PID al que se ató la sesión (--while)
+#   - no hay archivo de estado (se borra en cada arranque => a prueba de crash)
+
+set -u
+
+STATE=/var/run/clamshell.state
+MIN_BATT=${CLAMSHELL_MIN_BATT:-20}
+
+batt_pct() { pmset -g batt | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+on_ac()    { pmset -g batt | grep -q "'AC Power'"; }
+sleep_disabled() { pmset -g | awk '/SleepDisabled/{print $2}'; }
+set_ds()   { pmset -a disablesleep "$1" >/dev/null 2>&1; }
+
+need_root() {
+  if [ "$(id -u)" != "0" ]; then
+    echo "clamshell: '$1' necesita root. Usá: sudo clamshell $*" >&2
+    exit 1
+  fi
+}
+
+case "${1:-status}" in
+
+  on)
+    shift
+    hours=4; pid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --while) pid="${2:-}"; shift 2 ;;
+        *)       hours="$1";   shift   ;;
+      esac
+    done
+    case "$hours" in ''|*[!0-9]*) echo "clamshell: las horas deben ser un entero" >&2; exit 1 ;; esac
+    [ "$hours" -ge 1 ] && [ "$hours" -le 24 ] || { echo "clamshell: horas fuera de rango (1-24)" >&2; exit 1; }
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "clamshell: el PID $pid no existe" >&2; exit 1
+    fi
+    need_root on
+    until=$(( $(date +%s) + hours * 3600 ))
+    printf 'until=%s\npid=%s\n' "$until" "$pid" > "$STATE"
+    chmod 644 "$STATE"
+    set_ds 1
+    echo "clamshell ON hasta $(date -r "$until" '+%H:%M') (${hours}h)${pid:+, atado al PID $pid}"
+    echo "Se apaga solo si la batería baja de ${MIN_BATT}% sin cargador."
+    ;;
+
+  off)
+    need_root off
+    set_ds 0
+    rm -f "$STATE"
+    echo "clamshell OFF — el Mac vuelve a dormir con la tapa cerrada."
+    ;;
+
+  watchdog)
+    # Sin estado: si quedó disablesleep=1 colgado (crash, reinicio), apagarlo.
+    if [ ! -f "$STATE" ]; then
+      if [ "$(sleep_disabled)" = "1" ]; then
+        set_ds 0
+        logger -t clamshell "off: no hay estado y disablesleep estaba en 1 (limpieza)"
+      fi
+      exit 0
+    fi
+
+    until=0; pid=""
+    . "$STATE"
+
+    motivo=""
+    now=$(date +%s)
+    if [ "$now" -ge "${until:-0}" ]; then
+      motivo="se venció el plazo"
+    elif [ -n "${pid:-}" ] && ! kill -0 "$pid" 2>/dev/null; then
+      motivo="murió el proceso $pid"
+    elif ! on_ac; then
+      b=$(batt_pct)
+      if [ -n "$b" ] && [ "$b" -lt "$MIN_BATT" ]; then
+        motivo="batería en ${b}% sin cargador"
+      fi
+    fi
+
+    if [ -n "$motivo" ]; then
+      set_ds 0
+      rm -f "$STATE"
+      logger -t clamshell "off: $motivo"
+    else
+      [ "$(sleep_disabled)" = "1" ] || set_ds 1
+    fi
+    ;;
+
+  status)
+    ds=$(sleep_disabled)
+    b=$(batt_pct)
+    fuente=$(on_ac && echo "cargador" || echo "batería")
+    if [ -f "$STATE" ]; then
+      until=0; pid=""
+      . "$STATE"
+      restan=$(( (until - $(date +%s)) / 60 ))
+      echo "clamshell: ON (disablesleep=$ds) — quedan ${restan} min${pid:+, atado al PID $pid}"
+    else
+      echo "clamshell: OFF (disablesleep=$ds)"
+    fi
+    echo "energía: ${b}% desde ${fuente}"
+    ;;
+
+  *)
+    echo "uso: clamshell {on [horas] [--while PID] | off | status}" >&2
+    exit 1
+    ;;
+esac
